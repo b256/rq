@@ -62,12 +62,14 @@ def show_queues(args):
     ratio = chartwidth * 1.0 / scale
 
     for q in qs:
+        dq = q.done_queue
+        done = dq.count
         count = counts[q]
         if not args.raw:
             chart = green('|' + '█' * int(ratio * count))
-            line = '%-12s %s %d' % (q.name, chart, count)
+            line = '%-12s %s %d (%d done)' % (q.name, chart, count, done)
         else:
-            line = 'queue %s %d' % (q.name, count)
+            line = 'queue %s %d (%d done)' % (q.name, count, done)
         print(line)
 
         num_jobs += count

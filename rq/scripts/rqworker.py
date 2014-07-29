@@ -12,6 +12,7 @@ from rq.contrib.legacy import cleanup_ghosts
 from rq.scripts import add_standard_arguments, read_config_file, setup_default_arguments, setup_redis
 from rq.utils import import_attribute
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +29,8 @@ def parse_args():
     parser.add_argument('--sentry-dsn', action='store', default=None, metavar='URL', help='Report exceptions to this Sentry DSN')
     parser.add_argument('--pid', action='store', default=None,
                         help='Write the process ID number to a file at the specified path')
+    parser.add_argument('--multiprocessing', action='store_true', default=False,
+                        help="Jobs execution using multiprocessing instead of fork (always true on Windows)")
     parser.add_argument('queues', nargs='*', help='The queues to listen on (default: \'default\')')
 
     return parser.parse_args()
@@ -78,7 +81,7 @@ def main():
 
     try:
         queues = list(map(Queue, args.queues))
-        w = worker_class(queues, name=args.name)
+        w = worker_class(queues, name=args.name, use_multiprocessing=args.multiprocessing)
 
         # Should we configure Sentry?
         if args.sentry_dsn:

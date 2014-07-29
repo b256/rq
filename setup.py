@@ -72,5 +72,6 @@ setup(
         'Topic :: System :: Systems Administration',
         'Topic :: System :: Monitoring',
 
-    ]
+    ],
+    test_suite='tests.suite'
 )

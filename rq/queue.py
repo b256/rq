@@ -1,3 +1,5 @@
+# coding=utf-8
+import time
 import uuid
 
 from .connections import resolve_connection
@@ -7,6 +9,57 @@ from .utils import utcnow
 from .exceptions import (DequeueTimeout, InvalidJobOperationError,
                          NoSuchJobError, UnpickleError)
 from .compat import total_ordering, string_types, as_text
+
+
+def release_job(job_or_id, queue_or_name=None, connection=None):
+    """ Release a job that was previously created as "deferred", either in its original queue or in the queue passed in the queue_or_name parameter.
+    """
+    connection = resolve_connection(connection)
+    if not isinstance(job_or_id, Job):
+        assert isinstance(job_or_id, (str, unicode))
+        # OK, we got a job id
+        if Job.exists(job_or_id, connection=connection):
+            job = Job.fetch(job_or_id, connection=connection)
+        else:
+            raise NoSuchJobError("There is no job with id '{0}'".format(job_or_id))
+    else:
+        job = job_or_id
+
+    if not job.is_deferred:
+        raise InvalidJobOperationError("Job id '{0}' status is {1} and not 'deferred'".format(job_or_id, job.status))
+
+    # Get associated queue
+    if queue_or_name is None:
+        queue = Queue(name=job.origin, connection=connection)
+    elif isinstance(queue_or_name, Queue):
+        queue = queue_or_name
+    else:  # A string (?)
+        assert isinstance(queue_or_name, (str, unicode))
+        queue = Queue(name=queue_or_name, connection=connection)
+    result = connection.srem('rq:deferred', job.id)
+    if result == 0:
+        raise NoSuchJobError('No such blocked job: %s' % job.id)
+
+    job.status = Status.QUEUED
+    job.save()
+    queue.enqueue_job(job)
+
+    if True:
+        return
+
+    # Finding and activating dependents of this job
+    depend_count = connection.scard(job.dependents_key)
+    if depend_count > 0:
+        for a_job_id in connection.smembers(job.dependents_key):
+            a_job = Job.fetch(a_job_id, connection=connection)
+            a_job.status = Status.QUEUED
+            job.save()
+            if a_job.origin != queue.name:  # Slight optim...
+                a_queue = Queue(name=a_job.origin, connection=connection)
+            else:
+                a_queue = queue
+            a_queue.enqueue_job(a_job)
+    return
 
 
 def get_failed_queue(connection=None):
@@ -55,6 +108,10 @@ class Queue(object):
         self._key = '%s%s' % (prefix, name)
         self._default_timeout = default_timeout
         self._async = async
+        if self.__class__ is Queue:
+            # No such features for inheriting queues types
+            self.done_queue = DoneQueue.of_parent(self)
+            self.wip_queue = WIPQueue.of_parent(self)
 
     @property
     def key(self):
@@ -108,6 +165,13 @@ class Queue(object):
         """Returns a count of all messages in the queue."""
         return self.connection.llen(self.key)
 
+    def release_job_here(self, job_or_id):
+        """Release a job that was deferred into *this* queue (i.e. change the job initialy declared queue is needed)
+           If you don't want to affect the job originally chosen queue use the module function release_job
+           :param job_or_id: the job instance or the job_id of the job to be release from its deferred state i.e. put back into this queue.
+           """
+        release_job(job_or_id=job_or_id, queue_or_name=self)
+
     def remove(self, job_or_id):
         """Removes Job from queue, accepts either a Job instance or ID."""
         job_id = job_or_id.id if isinstance(job_or_id, Job) else job_or_id
@@ -117,7 +181,7 @@ class Queue(object):
         """Removes all "dead" jobs from the queue by cycling through it, while
         guarantueeing FIFO semantics.
         """
-        COMPACT_QUEUE = 'rq:queue:_compact:{0}'.format(uuid.uuid4())
+        COMPACT_QUEUE = '{0}_compact:{1}'.format(self.redis_queue_namespace_prefix, uuid.uuid4())
 
         self.connection.rename(self.key, COMPACT_QUEUE)
         while True:
@@ -134,7 +198,8 @@ class Queue(object):
 
 
     def enqueue_call(self, func, args=None, kwargs=None, timeout=None,
-                     result_ttl=None, description=None, depends_on=None):
+                     result_ttl=None, description=None, depends_on=None,
+                     deferred=False, blocked_by=None):
         """Creates a job to represent the delayed function call and enqueues
         it.
 
@@ -144,20 +209,30 @@ class Queue(object):
         """
         timeout = timeout or self._default_timeout
 
+        # TODO: job with dependency shouldn't have "queued" as status
+        init_status = Status.DEFERRED if (deferred or blocked_by) else Status.QUEUED
+
+        # blocked_by some job implies depends_on some job
+        if blocked_by:
+            depends_on = blocked_by
         job = Job.create(func, args, kwargs, connection=self.connection,
-                         result_ttl=result_ttl, status=None if depends_on else Status.QUEUED,
+                         result_ttl=result_ttl, status=init_status,
                          description=description, depends_on=depends_on, timeout=timeout)
 
-        # A job having unmet dependencies will not be enqueued right away
-        if depends_on:
+        # If job depends on an unfinished job, register itself on it's
+        # parent's dependents instead of enqueueing it.
+        if depends_on is not None:
             if isinstance(depends_on, Job):
-                depends_on = [depends_on]            
+                depends_on = [depends_on]
             remaining_dependencies = job.register_dependencies(depends_on)
             if remaining_dependencies:
                 job.save()
                 return job
-        
-        return self.enqueue_job(job)
+
+        if init_status == Status.DEFERRED:
+            return self.defer_job(job)
+        else:
+            return self.enqueue_job(job)
 
     def enqueue(self, f, *args, **kwargs):
         """Creates a job to represent the delayed function call and enqueues
@@ -183,18 +258,41 @@ class Queue(object):
         description = None
         result_ttl = None
         depends_on = None
-        if 'args' in kwargs or 'kwargs' in kwargs or 'depends_on' in kwargs:
+        deferred = False
+        blocked_by = False
+        if any((token in kwargs for token in ('args', 'kwargs', 'depends_on', 'deferred', 'blocked_by'))):
             assert args == (), 'Extra positional arguments cannot be used when using explicit args and kwargs.'  # noqa
             timeout = kwargs.pop('timeout', None)
             description = kwargs.pop('description', None)
             args = kwargs.pop('args', None)
             result_ttl = kwargs.pop('result_ttl', None)
             depends_on = kwargs.pop('depends_on', None)
+            deferred = kwargs.pop('deferred', False)
+            blocked_by = kwargs.pop('blocked_by', None)
             kwargs = kwargs.pop('kwargs', None)
 
         return self.enqueue_call(func=f, args=args, kwargs=kwargs,
                                  timeout=timeout, result_ttl=result_ttl,
-                                 description=description, depends_on=depends_on)
+                                 description=description, depends_on=depends_on,
+                                 deferred=deferred, blocked_by=blocked_by)
+
+    def defer_job(self, job, set_meta_data=True):
+        """Enqueues a job for a deferred execution (conditioned by a future release)
+
+        If the `set_meta_data` argument is `True` (default), it will update
+        the properties `origin` and `enqueued_at`.
+        """
+        value = job.id
+        self.connection.sadd('rq:deferred', value)
+
+        if set_meta_data:
+            job.origin = self.name
+            job.enqueued_at = utcnow()
+
+        if job.timeout is None:
+            job.timeout = self.DEFAULT_TIMEOUT
+        job.save()
+        return job
 
     def enqueue_job(self, job, set_meta_data=True):
         """Enqueues a job for delayed execution.
@@ -261,6 +359,7 @@ class Queue(object):
 
         Returns a Job instance, which can be executed or inspected.
         """
+        # ISSUE: This method does not seem to be used anywhere except in tests
         job_id = self.pop_job_id()
         if job_id is None:
             return None
@@ -366,3 +465,86 @@ class FailedQueue(Queue):
         job.exc_info = None
         q = Queue(job.origin, connection=self.connection)
         q.enqueue_job(job)
+
+
+class ChildQueue(object):
+    """This is a mixin class for classes inheriting from :class:`Queue` that only provides
+    a factory classmethod that initialises main attributes from its parent object
+    (which is supposed to be a :class:`Queue` or subclass of it)
+    """
+    @classmethod
+    def of_parent(cls, parent):
+        """Factory method
+        """
+        #queue = cls.from_queue_key(parent.name, connection=parent.connection)
+        queue = cls(parent.name, parent._default_timeout, parent.connection, parent._async)
+        queue.parent = parent
+        return queue
+
+
+class WIPQueue(Queue, ChildQueue):
+    """This queue will handle "work in process" jobs
+
+    :param name: Name of the WIP queue (the same as the associated jobs queue)
+    :type name: :class:`str`
+    :param default_timeout: timeout of the associated job
+    :param default_timeout: :class:`float`
+    :param connection: Redis connection to be used
+    :type connection: :class:`redis.StrictRedis`
+    """
+    redis_queue_namespace_prefix = 'rq:wipqueue:'
+
+    def add_job(self, job):
+        """Adding a job in positional slot (latest timeout first)
+        """
+        timeout = job.timeout
+        if timeout is None:
+            timeout = self._default_timeout or self.DEFAULT_TIMEOUT
+        rank = time.time() + timeout
+        self.connection.zadd(self.key, rank, job.id)
+        return
+
+    def remove_job(self, job):
+        """Removes a job from the WIP queue
+
+        :param job: a :class:`rq.job.Job` object or a job id
+        :return: The count of removed jobs, thus 0 or 1.
+        """
+        if isinstance(job, Job):
+            job = job.id
+        return self.connection.zrem(self.key, job)
+
+    def remove_expired_jobs(self):
+        """Removes the oldest expired in the queue
+        """
+        to_remove = self.connection.zrangebyscore(self.key, '-inf', time.time())
+        if len(to_remove) > 0:
+            self.connection.zrem(self.key, *to_remove)
+        return
+
+
+class DoneQueue(Queue, ChildQueue):
+    """This queue will handle "successfully done jobs"
+    """
+    redis_queue_namespace_prefix = 'rq:donequeue:'
+    redis_queues_keys = 'rq:donequeues'
+
+    def add_job(self, job):
+        """Adding a job in positional slot (latest timeout first)
+        """
+        timeout = job.timeout
+        if timeout is None:
+            timeout = self._default_timeout or self.DEFAULT_TIMEOUT
+        rank = time.time() + timeout
+        self.connection.zadd(self.key, rank, job.id)
+        return
+
+    def requeue_job(self, job_id):
+        """Puts back in the parent queue the job id
+
+        Issue: take care of job dependency. Means that requeuing a job requires its dependent jobs are
+        in the same Done queue too.
+        In that case, we must requeue the jobs in the dependency reverse order.
+        """
+        pass
+

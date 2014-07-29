@@ -6,6 +6,8 @@
 /.envrc
 /.tox
 /dist
+.idea/
+.DS_Store
 /build
 
 .idea

@@ -11,6 +11,8 @@ from .utils import import_attribute, utcnow, utcformat, utcparse
 from redis import WatchError
 from rq.compat import text_type, decode_redis_hash, as_text, as_bytes
 
+Queue = None  # Avoiding recursive imports
+
 
 def enum(name, *sequential, **named):
     values = dict(zip(sequential, range(len(sequential))), **named)
@@ -18,7 +20,7 @@ def enum(name, *sequential, **named):
 
 Status = enum('Status',
               QUEUED='queued', FINISHED='finished', FAILED='failed',
-              STARTED='started')
+              STARTED='started', DEFERRED='deferred')
 
 # Sentinel value to mark that some of our lazily evaluated properties have not
 # yet been evaluated.
@@ -57,14 +59,14 @@ def requeue_job(job_id, connection=None):
     fq.requeue(job_id)
 
 
-def get_current_job():
+def get_current_job(connection=None):
     """Returns the Job instance that is currently being executed.  If this
     function is invoked from outside a job context, None is returned.
     """
     job_id = _job_stack.top
     if job_id is None:
         return None
-    return Job.fetch(job_id)
+    return Job.fetch(job_id, connection=connection)
 
 
 class Job(object):
@@ -141,6 +143,10 @@ class Job(object):
     @property
     def is_started(self):
         return self.status == Status.STARTED
+
+    @property
+    def is_deferred(self):
+        return self.status == Status.DEFERRED
 
     @property
     def dependencies(self):

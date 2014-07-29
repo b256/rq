@@ -1,6 +1,7 @@
 import sys
 import os
 import errno
+import multiprocessing
 import random
 import time
 try:
@@ -12,6 +13,7 @@ import socket
 import signal
 import traceback
 import logging
+from .config import HAVE_WINDOWS
 from .queue import Queue, get_failed_queue
 from .connections import get_current_connection
 from .job import Job, Status
@@ -29,7 +31,6 @@ blue = make_colorizer('darkblue')
 DEFAULT_WORKER_TTL = 420
 DEFAULT_RESULT_TTL = 500
 logger = logging.getLogger(__name__)
-
 
 class StopRequested(Exception):
     pass
@@ -98,7 +99,8 @@ class Worker(object):
 
     def __init__(self, queues, name=None,
                  default_result_ttl=DEFAULT_RESULT_TTL, connection=None,
-                 exc_handler=None, default_worker_ttl=DEFAULT_WORKER_TTL):  # noqa
+                 exc_handler=None, default_worker_ttl=DEFAULT_WORKER_TTL,
+                 use_multiprocessing=False):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
@@ -122,6 +124,10 @@ class Worker(object):
         self.push_exc_handler(self.move_to_failed_queue)
         if exc_handler is not None:
             self.push_exc_handler(exc_handler)
+
+        self.fork_and_perform_job = (self._fork_and_perform_job_mp
+                                     if use_multiprocessing or HAVE_WINDOWS else
+                                     self._fork_and_perform_job_fork)
 
 
     def validate_queues(self):  # noqa
@@ -318,7 +324,9 @@ class Worker(object):
                               blue(job.description), job.id))
 
                 self.heartbeat((job.timeout or 180) + 60)
+                queue.wip_queue.add_job(job)
                 self.fork_and_perform_job(job)
+                queue.wip_queue.remove_job(job)
                 self.heartbeat()
 
                 if job.status == Status.FINISHED:
@@ -363,31 +371,54 @@ class Worker(object):
         self.log.debug('Sent heartbeat to prevent worker timeout. '
                        'Next one should arrive within {0} seconds.'.format(timeout))
 
-    def fork_and_perform_job(self, job):
+    # 2 implementations for fork_and_perform_job. See __init__
+
+    def _fork_and_perform_job_mp(self, job):
         """Spawns a work horse to perform the actual work and passes it a job.
         The worker will wait for the work horse and make sure it executes
         within the given timeout bounds, or will end the work horse with
         SIGALRM.
         """
-        child_pid = os.fork()
-        if child_pid == 0:
-            self.main_work_horse(job)
+        horse = multiprocessing.Process(target=self.main_work_horse, args=(job,))
+        horse.start()
+        horse.join()
+
+
+    def _fork_and_perform_job_fork(self, job):
+        """Spawns a work horse to perform the actual work and passes it a job.
+        The worker will wait for the work horse and make sure it executes
+        within the given timeout bounds, or will end the work horse with
+        SIGALRM.
+        """
+        # Experimental support for win32
+        if HAVE_WINDOWS:
+            try:
+                ret_code = self.main_work_horse(job)
+                if ret_code:
+                    # FIXME: should log something here...
+                    dummy = 0  # No syntax error
+            except:
+                pass
         else:
-            self._horse_pid = child_pid
-            self.procline('Forked %d at %d' % (child_pid, time.time()))
-            while True:
-                try:
-                    os.waitpid(child_pid, 0)
-                    break
-                except OSError as e:
-                    # In case we encountered an OSError due to EINTR (which is
-                    # caused by a SIGINT or SIGTERM signal during
-                    # os.waitpid()), we simply ignore it and enter the next
-                    # iteration of the loop, waiting for the child to end.  In
-                    # any other case, this is some other unexpected OS error,
-                    # which we don't want to catch, so we re-raise those ones.
-                    if e.errno != errno.EINTR:
-                        raise
+            child_pid = os.fork()
+            if child_pid == 0:
+                self.main_work_horse(job)
+            else:
+                self._horse_pid = child_pid
+                self.procline('Forked %d at %d' % (child_pid, time.time()))
+                while True:
+                    try:
+                        os.waitpid(child_pid, 0)
+                        break
+                    except OSError as e:
+                        # In case we encountered an OSError due to EINTR (which is
+                        # caused by a SIGINT or SIGTERM signal during
+                        # os.waitpid()), we simply ignore it and enter the next
+                        # iteration of the loop, waiting for the child to end.  In
+                        # any other case, this is some other unexpected OS error,
+                        # which we don't want to catch, so we re-raise those ones.
+                        if e.errno != errno.EINTR:
+                            raise
 
     def main_work_horse(self, job):
         """This is the entry point of the newly spawned work horse."""
@@ -408,9 +439,12 @@ class Worker(object):
 
         success = self.perform_job(job)
 
-        # os._exit() is the way to exit from childs after a fork(), in
-        # constrast to the regular sys.exit()
-        os._exit(int(not success))
+        if HAVE_WINDOWS:
+            return int(not success)
+        else:
+            # os._exit() is the way to exit from childs after a fork(), in
+            # constrast to the regular sys.exit()
+            os._exit(int(not success))
 
     def perform_job(self, job):
         """Performs the actual work of a job.  Will/should only be called
@@ -420,28 +454,28 @@ class Worker(object):
             job.func_name,
             job.origin, time.time()))
 
-        try:
-            with death_penalty_after(job.timeout or Queue.DEFAULT_TIMEOUT):
-                rv = job.perform()
+        with self.connection._pipeline() as pipeline:
+            try:
+                with death_penalty_after(job.timeout or Queue.DEFAULT_TIMEOUT):
+                    rv = job.perform()
 
-            # Pickle the result in the same try-except block since we need to
-            # use the same exc handling when pickling fails
-            job._result = rv
-            job._status = Status.FINISHED
-            job.ended_at = utcnow()
+                # Pickle the result in the same try-except block since we need to
+                # use the same exc handling when pickling fails
+                job._result = rv
+                job._status = Status.FINISHED
+                job.ended_at = utcnow()
 
-            result_ttl = job.get_ttl(self.default_result_ttl)
-            pipeline = self.connection._pipeline()
-            if result_ttl != 0:
-                job.save(pipeline=pipeline)
-            job.cleanup(result_ttl, pipeline=pipeline)
-            pipeline.execute()
+                result_ttl = job.get_ttl(self.default_result_ttl)
+                if result_ttl != 0:
+                    job.save(pipeline=pipeline)
+                job.cleanup(result_ttl, pipeline=pipeline)
+                pipeline.execute()
 
-        except:
-            # Use the public setter here, to immediately update Redis
-            job.status = Status.FAILED
-            self.handle_exception(job, *sys.exc_info())
-            return False
+            except Exception:
+                # Use the public setter here, to immediately update Redis
+                job.status = Status.FAILED
+                self.handle_exception(job, *sys.exc_info())
+                return False
 
         if rv is None:
             self.log.info('Job OK')

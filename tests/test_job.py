@@ -7,7 +7,7 @@ try:
 except ImportError:
     from pickle import loads, dumps
 from rq.compat import as_text
-from rq.job import Job, get_current_job
+from rq.job import Job, get_current_job, Status
 from rq.exceptions import NoSuchJobError, UnpickleError
 from rq.queue import Queue
 from rq.utils import utcformat

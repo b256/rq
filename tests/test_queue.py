@@ -1,9 +1,9 @@
 from tests import RQTestCase
 from tests.fixtures import Number, div_by_zero, say_hello, some_calculation
-from rq import Queue, get_failed_queue
+from rq import Queue, get_failed_queue, release_job
 from rq.job import Job, Status
 from rq.worker import Worker
-from rq.exceptions import InvalidJobOperationError
+from rq.exceptions import InvalidJobOperationError, NoSuchJobError
 
 
 class TestQueue(RQTestCase):
@@ -316,6 +316,35 @@ class TestQueue(RQTestCase):
         job = q.enqueue_call(say_hello, depends_on=parent_job2)
         self.assertEqual(q.job_ids, [job.id])
         self.assertEqual(job.timeout, Queue.DEFAULT_TIMEOUT)
+
+    def test_defer_job(self):
+        """test that a job created as deferred is not put in a queue"""
+        q = Queue()
+        job = q.enqueue(say_hello, deferred=True)
+        self.assertEqual(job.status, Status.DEFERRED)
+        self.assertNotIn(job.id, q.job_ids)
+
+    def test_release_job(self):
+        q = Queue()
+        job = q.enqueue(say_hello, deferred=True)
+        release_job(job)
+        self.assertIn(job.id, q.job_ids)
+
+    def test_release_job_in_other_queue(self):
+        q = Queue(name="1")
+        job = q.enqueue(say_hello, deferred=True)
+        q2 = Queue(name="2")
+        release_job(job, queue_or_name=q2)
+        self.assertIn(job.id, q2.job_ids)
+
+    def test_release_job_here(self):
+        q = Queue(name="1")
+        job = q.enqueue(say_hello, deferred=True)
+        q2 = Queue(name="2")
+        q2.release_job_here(job)
+        self.assertIn(job.id, q2.job_ids)
+
+
 
     def test_enqueue_job_with_dependency_and_timeout(self):
         """Jobs still know their specified timeout after being scheduled as reverse_dependencies."""

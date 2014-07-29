@@ -1,4 +1,5 @@
 import logging
+import os
 from rq.compat import is_python_version
 if is_python_version((2, 7), (3, 2)):
     import unittest
@@ -76,3 +77,10 @@ class RQTestCase(unittest.TestCase):
         testconn = pop_connection()
         assert testconn == cls.testconn, 'Wow, something really nasty ' \
                 'happened to the Redis connection stack. Check your setup.'
+
+
+def suite():
+    here = os.path.dirname(os.path.abspath(__file__))
+    loader = unittest.TestLoader()
+    all_tests = loader.discover(here)
+    return all_tests
