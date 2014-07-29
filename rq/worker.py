@@ -1,28 +1,36 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+
 import errno
 import multiprocessing
+import logging
+import os
 import random
+import signal
+import socket
+import sys
 import time
+import traceback
+from .config import HAVE_WINDOWS
+import warnings
+
+from rq.compat import as_text, string_types, text_type
+
+from .connections import get_current_connection
+from .exceptions import DequeueTimeout, NoQueueError
+from .job import Job, Status
+from .queue import Queue, get_failed_queue
+from .logutils import setup_loghandlers
+from .timeouts import UnixSignalDeathPenalty
+from .utils import import_attribute, make_colorizer, utcformat, utcnow
+from .version import VERSION
+
 try:
     from procname import setprocname
 except ImportError:
     def setprocname(*args, **kwargs):  # noqa
         pass
-import socket
-import signal
-import traceback
-import logging
-from .config import HAVE_WINDOWS
-from .queue import Queue, get_failed_queue
-from .connections import get_current_connection
-from .job import Job, Status
-from .utils import make_colorizer, utcnow, utcformat
-from .logutils import setup_loghandlers
-from .exceptions import NoQueueError, UnpickleError, DequeueTimeout
-from .timeouts import death_penalty_after
-from .version import VERSION
-from rq.compat import text_type, as_text
 
 green = make_colorizer('darkgreen')
 yellow = make_colorizer('darkyellow')
@@ -60,6 +68,9 @@ def signal_name(signum):
 class Worker(object):
     redis_worker_namespace_prefix = 'rq:worker:'
     redis_workers_keys = 'rq:workers'
+    death_penalty_class = UnixSignalDeathPenalty
+    queue_class = Queue
+    job_class = Job
 
     @classmethod
     def all(cls, connection=None):
@@ -92,26 +103,34 @@ class Worker(object):
         worker = cls([], name, connection=connection)
         queues = as_text(connection.hget(worker.key, 'queues'))
         worker._state = connection.hget(worker.key, 'state') or '?'
+        worker._job_id = connection.hget(worker.key, 'current_job') or None
         if queues:
-            worker.queues = [Queue(queue, connection=connection)
+            worker.queues = [cls.queue_class(queue, connection=connection)
                              for queue in queues.split(',')]
         return worker
 
     def __init__(self, queues, name=None,
                  default_result_ttl=DEFAULT_RESULT_TTL, connection=None,
                  exc_handler=None, default_worker_ttl=DEFAULT_WORKER_TTL,
-                 use_multiprocessing=False):  # noqa
+                 job_class=None, use_multiprocessing=False):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
-        if isinstance(queues, Queue):
+        if isinstance(queues, self.queue_class):
             queues = [queues]
         self._name = name
         self.queues = queues
         self.validate_queues()
         self._exc_handlers = []
+
+        if default_result_ttl is None:
+            default_result_ttl = DEFAULT_RESULT_TTL
         self.default_result_ttl = default_result_ttl
+
+        if default_worker_ttl is None:
+            default_worker_ttl = DEFAULT_WORKER_TTL
         self.default_worker_ttl = default_worker_ttl
+
         self._state = 'starting'
         self._is_horse = False
         self._horse_pid = 0
@@ -129,13 +148,17 @@ class Worker(object):
                                      if use_multiprocessing or HAVE_WINDOWS else
                                      self._fork_and_perform_job_fork)
 
+        if job_class is not None:
+            if isinstance(job_class, string_types):
+                job_class = import_attribute(job_class)
+            self.job_class = job_class
 
-    def validate_queues(self):  # noqa
+    def validate_queues(self):
         """Sanity check for the given queues."""
         if not iterable(self.queues):
             raise ValueError('Argument queues not iterable.')
         for queue in self.queues:
-            if not isinstance(queue, Queue):
+            if not isinstance(queue, self.queue_class):
                 raise NoQueueError('Give each worker at least one Queue.')
 
     def queue_names(self):
@@ -146,8 +169,7 @@ class Worker(object):
         """Returns the Redis keys representing this worker's queues."""
         return map(lambda q: q.key, self.queues)
 
-
-    @property  # noqa
+    @property
     def name(self):
         """Returns the name of the worker, under which it is registered to the
         monitoring system.
@@ -190,8 +212,7 @@ class Worker(object):
         """
         setprocname('rq: %s' % (message,))
 
-
-    def register_birth(self):  # noqa
+    def register_birth(self):
         """Registers its own birth."""
         self.log.debug('Registering birth of worker %s' % (self.name,))
         if self.connection.exists(self.key) and \
@@ -219,14 +240,52 @@ class Worker(object):
             p.expire(self.key, 60)
             p.execute()
 
-    def set_state(self, new_state):
-        self._state = new_state
-        self.connection.hset(self.key, 'state', new_state)
+    def set_state(self, state, pipeline=None):
+        self._state = state
+        connection = pipeline if pipeline is not None else self.connection
+        connection.hset(self.key, 'state', state)
+
+    def _set_state(self, state):
+        """Raise a DeprecationWarning if ``worker.state = X`` is used"""
+        warnings.warn(
+            "worker.state is deprecated, use worker.set_state() instead.",
+            DeprecationWarning
+        )
+        self.set_state(state)
 
     def get_state(self):
         return self._state
 
-    state = property(get_state, set_state)
+    def _get_state(self):
+        """Raise a DeprecationWarning if ``worker.state == X`` is used"""
+        warnings.warn(
+            "worker.state is deprecated, use worker.get_state() instead.",
+            DeprecationWarning
+        )
+        return self.get_state()
+
+    state = property(_get_state, _set_state)
+
+    def set_current_job_id(self, job_id, pipeline=None):
+        connection = pipeline if pipeline is not None else self.connection
+
+        if job_id is None:
+            connection.hdel(self.key, 'current_job')
+        else:
+            connection.hset(self.key, 'current_job', job_id)
+
+    def get_current_job_id(self, pipeline=None):
+        connection = pipeline if pipeline is not None else self.connection
+        return as_text(connection.hget(self.key, 'current_job'))
+
+    def get_current_job(self):
+        """Returns the job id of the currently executing job."""
+        job_id = self.get_current_job_id()
+
+        if job_id is None:
+            return None
+
+        return self.job_class.fetch(job_id, self.connection)
 
     @property
     def stopped(self):
@@ -269,7 +328,7 @@ class Worker(object):
 
             # If shutdown is requested in the middle of a job, wait until
             # finish before shutting down
-            if self.state == 'busy':
+            if self.get_state() == 'busy':
                 self._stopped = True
                 self.log.debug('Stopping after current horse is finished. '
                                'Press Ctrl+C again for a cold shutdown.')
@@ -279,8 +338,7 @@ class Worker(object):
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
 
-
-    def work(self, burst=False):  # noqa
+    def work(self, burst=False):
         """Starts the work loop.
 
         Pops and performs all jobs on the current list of queues.  When all
@@ -295,18 +353,13 @@ class Worker(object):
         did_perform_work = False
         self.register_birth()
         self.log.info('RQ worker started, version %s' % VERSION)
-        self.state = 'starting'
+        self.set_state('starting')
         try:
             while True:
                 if self.stopped:
                     self.log.info('Stopping on request.')
                     break
-                self.state = 'idle'
-                qnames = self.queue_names()
-                self.procline('Listening on %s' % ','.join(qnames))
-                self.log.info('')
-                self.log.info('*** Listening on %s...' %
-                              green(', '.join(qnames)))
+
                 timeout = None if burst else max(1, self.default_worker_ttl - 60)
                 try:
                     result = self.dequeue_job_and_maintain_ttl(timeout)
@@ -315,9 +368,8 @@ class Worker(object):
                 except StopRequested:
                     break
 
-                self.state = 'busy'
-
                 job, queue = result
+
                 # Use the public setter here, to immediately update Redis
                 job.status = Status.STARTED
                 self.log.info('%s: %s (%s)' % (green(queue.name),
@@ -343,11 +395,25 @@ class Worker(object):
 
     def dequeue_job_and_maintain_ttl(self, timeout):
         result = None
+        qnames = self.queue_names()
+
+        self.set_state('idle')
+        self.procline('Listening on %s' % ','.join(qnames))
+        self.log.info('')
+        self.log.info('*** Listening on %s...' %
+                      green(', '.join(qnames)))
+
         while True:
             self.heartbeat()
+
             try:
-                result = Queue.dequeue_any(self.queues, timeout,
-                                           connection=self.connection)
+                result = self.queue_class.dequeue_any(self.queues, timeout,
+                                                      connection=self.connection)
+                if result is not None:
+                    job, queue = result
+                    self.log.info('%s: %s (%s)' % (green(queue.name),
+                                  blue(job.description), job.id))
+
                 break
             except DequeueTimeout:
                 pass
@@ -382,7 +448,6 @@ class Worker(object):
         horse = multiprocessing.Process(target=self.main_work_horse, args=(job,))
         horse.start()
         horse.join()
-
 
     def _fork_and_perform_job_fork(self, job):
         """Spawns a work horse to perform the actual work and passes it a job.
@@ -450,30 +515,39 @@ class Worker(object):
         """Performs the actual work of a job.  Will/should only be called
         inside the work horse's process.
         """
+
+        self.set_state('busy')
+        self.set_current_job_id(job.id)
+        self.heartbeat((job.timeout or 180) + 60)
+
         self.procline('Processing %s from %s since %s' % (
             job.func_name,
             job.origin, time.time()))
 
         with self.connection._pipeline() as pipeline:
             try:
-                with death_penalty_after(job.timeout or Queue.DEFAULT_TIMEOUT):
+                job.set_status(Status.STARTED)
+                with self.death_penalty_class(job.timeout or self.queue_class.DEFAULT_TIMEOUT):
                     rv = job.perform()
 
                 # Pickle the result in the same try-except block since we need to
                 # use the same exc handling when pickling fails
                 job._result = rv
-                job._status = Status.FINISHED
-                job.ended_at = utcnow()
+
+                self.set_current_job_id(None, pipeline=pipeline)
 
                 result_ttl = job.get_ttl(self.default_result_ttl)
                 if result_ttl != 0:
+                    job.ended_at = utcnow()
+                    job._status = Status.FINISHED
                     job.save(pipeline=pipeline)
                 job.cleanup(result_ttl, pipeline=pipeline)
+
                 pipeline.execute()
 
             except Exception:
                 # Use the public setter here, to immediately update Redis
-                job.status = Status.FAILED
+                job.set_status(Status.FAILED)
                 self.handle_exception(job, *sys.exc_info())
                 return False
 

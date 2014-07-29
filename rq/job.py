@@ -1,22 +1,44 @@
+# -*- coding: utf-8 -*-
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+
 import inspect
+import warnings
+from functools import partial
 from uuid import uuid4
-try:
-    from cPickle import loads, dumps, UnpicklingError
-except ImportError:  # noqa
-    from pickle import loads, dumps, UnpicklingError  # noqa
-from .local import LocalStack
-from .connections import resolve_connection
-from .exceptions import UnpickleError, NoSuchJobError
-from .utils import import_attribute, utcnow, utcformat, utcparse
+
+from rq.compat import as_text, decode_redis_hash, string_types, text_type
 from redis import WatchError
+
+from .connections import resolve_connection
+from .exceptions import NoSuchJobError, UnpickleError
+from .utils import import_attribute, utcformat, utcnow, utcparse
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+
+from .local import LocalStack
 from rq.compat import text_type, decode_redis_hash, as_text, as_bytes
 
 Queue = None  # Avoiding recursive imports
 
+# Serialize pickle dumps using the highest pickle protocol (binary, default
+# uses ascii)
+dumps = partial(pickle.dumps, protocol=pickle.HIGHEST_PROTOCOL)
+loads = pickle.loads
+# >>>>>>> master
+
 
 def enum(name, *sequential, **named):
     values = dict(zip(sequential, range(len(sequential))), **named)
-    return type(name, (), values)
+
+    # NOTE: Yes, we *really* want to cast using str() here.
+    # On Python 2 type() requires a byte string (which is str() on Python 2).
+    # On Python 3 it does not matter, so we'll use str(), which acts as
+    # a no-op.
+    return type(str(name), (), values)
 
 Status = enum('Status',
               QUEUED='queued', FINISHED='finished', FAILED='failed',
@@ -37,7 +59,7 @@ def unpickle(pickled_string):
     """
     try:
         obj = loads(pickled_string)
-    except (Exception, UnpicklingError) as e:
+    except Exception as e:
         raise UnpickleError('Could not unpickle.', pickled_string, e)
     return obj
 
@@ -99,8 +121,13 @@ class Job(object):
             job._func_name = func.__name__
         elif inspect.isfunction(func) or inspect.isbuiltin(func):
             job._func_name = '%s.%s' % (func.__module__, func.__name__)
-        else:  # we expect a string
-            job._func_name = func
+        elif isinstance(func, string_types):
+            job._func_name = as_text(func)
+        elif not inspect.isclass(func) and hasattr(func, '__call__'):  # a callable class instance
+            job._instance = func
+            job._func_name = '__call__'
+        else:
+            raise TypeError('Expected a callable or a string, but got: {}'.format(func))
         job._args = args
         job._kwargs = kwargs
 
@@ -118,31 +145,45 @@ class Job(object):
                 dependency.id if isinstance(dependency, Job) else dependency for dependency in depends_on)
         return job
 
-    def _get_status(self):
+    def get_status(self):
         self._status = as_text(self.connection.hget(self.key, 'status'))
         return self._status
 
-    def _set_status(self, status):
+    def _get_status(self):
+        warnings.warn(
+            "job.status is deprecated. Use job.get_status() instead",
+            DeprecationWarning
+        )
+        return self.get_status()
+
+    def set_status(self, status):
         self._status = status
         self.connection.hset(self.key, 'status', self._status)
+
+    def _set_status(self, status):
+        warnings.warn(
+            "job.status is deprecated. Use job.set_status() instead",
+            DeprecationWarning
+        )
+        self.set_status(status)
 
     status = property(_get_status, _set_status)
 
     @property
     def is_finished(self):
-        return self.status == Status.FINISHED
+        return self.get_status() == Status.FINISHED
 
     @property
     def is_queued(self):
-        return self.status == Status.QUEUED
+        return self.get_status() == Status.QUEUED
 
     @property
     def is_failed(self):
-        return self.status == Status.FAILED
+        return self.get_status() == Status.FAILED
 
     @property
     def is_started(self):
-        return self.status == Status.STARTED
+        return self.get_status() == Status.STARTED
 
     @property
     def is_deferred(self):
@@ -298,6 +339,9 @@ class Job(object):
         self._dependency_ids = []
         self.meta = {}
 
+    def __repr__(self):  # noqa
+        return 'Job(%r, enqueued_at=%r)' % (self._id, self.enqueued_at)
+
     # Data access
     def get_id(self):  # noqa
         """The job ID for this job instance. Generates an ID lazily the
@@ -406,7 +450,7 @@ class Job(object):
         self._dependency_ids = as_text(obj.get('dependency_ids', '')).split(' ')
         self.meta = unpickle(obj.get('meta')) if obj.get('meta') else {}
 
-    def dump(self):
+    def to_dict(self):
         """Returns a serialization of the current job instance"""
         obj = {}
         obj['created_at'] = utcformat(self.created_at or utcnow())
@@ -442,7 +486,7 @@ class Job(object):
         key = self.key
         connection = pipeline if pipeline is not None else self.connection
 
-        connection.hmset(key, self.dump())
+        connection.hmset(key, self.to_dict())
 
     def cancel(self):
         """Cancels the given job, which will prevent the job from ever being
@@ -455,9 +499,15 @@ class Job(object):
 
         NOTE: Any job that depends on this job becomes orphaned.
         """
-        pipeline = self.connection.pipeline()
+        from .queue import Queue
+        pipeline = self.connection._pipeline()
         self.delete(pipeline=pipeline)
         pipeline.delete(self.reverse_dependencies_key)
+
+        if self.origin:
+            queue = Queue(name=self.origin, connection=self.connection)
+            queue.remove(self, pipeline=pipeline)
+
         pipeline.execute()
 
     def delete(self, pipeline=None):
@@ -510,7 +560,7 @@ class Job(object):
             connection = pipeline if pipeline is not None else self.connection
             connection.expire(self.key, ttl)
 
-    def register_dependencies(self, dependencies):
+    def register_dependencies(self, dependencies, pipeline=None):
         """Register this job as being dependent on its dependencies.
         A job is added to its queue only if all its dependencies have succeeded.
 
@@ -519,8 +569,12 @@ class Job(object):
 
             rq:job:job_id:reverse_dependencies = {'job_id_1', 'job_id_2'}
         """
+
         remaining_dependencies = []
-        with self.connection.pipeline() as pipeline:
+        if pipeline is None:
+            pipeline = self.connection.pipeline()
+
+        with pipeline:
             while True:
                 try:
                     # Check whether any of dependencies have been met

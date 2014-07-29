@@ -7,7 +7,7 @@ from tests import RQTestCase
 from rq import Queue
 from rq.job import Job
 from rq.queue import WIPQueue
-from tests.fixtures import Number, div_by_zero, say_hello, do_nothing
+from tests.fixtures import say_hello, do_nothing
 
 
 @contextlib.contextmanager

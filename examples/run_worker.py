@@ -1,7 +1,8 @@
-from rq import Queue, Worker, Connection
-if '' not in sys.path:
-    sys.path.insert(0, '')
+# -*- coding: utf-8 -*-
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
+from rq import Connection, Queue, Worker
 
 if __name__ == '__main__':
     # Tell rq what Redis connection to use

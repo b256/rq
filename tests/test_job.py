@@ -1,17 +1,24 @@
+# -*- coding: utf-8 -*-
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+
 from datetime import datetime
+
+from rq.compat import as_text, PY2
+from rq.exceptions import NoSuchJobError, UnpickleError
+from rq.job import get_current_job, Job
+from rq.queue import Queue
+from rq.utils import utcformat
+
 from tests import RQTestCase
-from tests.fixtures import Number, some_calculation, say_hello, access_self
+from tests.fixtures import (access_self, CallableObject, Number, say_hello,
+                            some_calculation)
 from tests.helpers import strip_microseconds
+
 try:
     from cPickle import loads, dumps
 except ImportError:
     from pickle import loads, dumps
-from rq.compat import as_text
-from rq.job import Job, get_current_job, Status
-from rq.exceptions import NoSuchJobError, UnpickleError
-from rq.queue import Queue
-from rq.utils import utcformat
-
 
 class TestJob(RQTestCase):
     def test_create_empty_job(self):
@@ -76,6 +83,14 @@ class TestJob(RQTestCase):
         self.assertEquals(job.func, say_hello)
         self.assertIsNone(job.instance)
         self.assertEquals(job.args, ('World',))
+
+    def test_create_job_from_callable_class(self):
+        """Creation of jobs using a callable class specifier."""
+        kallable = CallableObject()
+        job = Job.create(func=kallable)
+
+        self.assertEquals(job.func, kallable.__call__)
+        self.assertEquals(job.instance, kallable)
 
     def test_job_properties_set_data_property(self):
         """Data property gets derived from the job tuple."""
@@ -229,7 +244,7 @@ class TestJob(RQTestCase):
         # equivalent to a worker not having the most up-to-date source code
         # and unable to import the function)
         data = self.testconn.hget(job.key, 'data')
-        unimportable_data = data.replace(b'say_hello', b'shut_up')
+        unimportable_data = data.replace(b'say_hello', b'nay_hello')
         self.testconn.hset(job.key, 'data', unimportable_data)
 
         job.refresh()
@@ -262,16 +277,19 @@ class TestJob(RQTestCase):
 
     def test_description_is_persisted(self):
         """Ensure that job's custom description is set properly"""
-        job = Job.create(func=say_hello, args=('Lionel',), description=u'Say hello!')
+        job = Job.create(func=say_hello, args=('Lionel',), description='Say hello!')
         job.save()
         Job.fetch(job.id, connection=self.testconn)
-        self.assertEquals(job.description, u'Say hello!')
+        self.assertEqual(job.description, 'Say hello!')
 
         # Ensure job description is constructed from function call string
         job = Job.create(func=say_hello, args=('Lionel',))
         job.save()
         Job.fetch(job.id, connection=self.testconn)
-        self.assertEquals(job.description, "tests.fixtures.say_hello('Lionel')")
+        if PY2:
+            self.assertEqual(job.description, "tests.fixtures.say_hello(u'Lionel')")
+        else:
+            self.assertEqual(job.description, "tests.fixtures.say_hello('Lionel')")
 
     def test_job_access_within_job_function(self):
         """The current job is accessible within the job function."""
@@ -342,9 +360,12 @@ class TestJob(RQTestCase):
 
     def test_cancel(self):
         """job.cancel() deletes itself & reverse_dependencies mapping from Redis."""
-        job = Job.create(func=say_hello)
+        queue = Queue(connection=self.testconn)
+        job = queue.enqueue(say_hello)
         job2 = Job.create(func=say_hello, depends_on=job)
         job2.register_dependencies([job])
         job.cancel()
         self.assertFalse(self.testconn.exists(job.key))
         self.assertFalse(self.testconn.exists(job.reverse_dependencies_key))
+
+        self.assertNotIn(job.id, queue.get_job_ids())

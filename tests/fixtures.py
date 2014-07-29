@@ -1,11 +1,15 @@
+# -*- coding: utf-8 -*-
 """
 This file contains all jobs that are used in tests.  Each of these test
 fixtures has a slighty different characteristics.
 """
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+
 import time
-from rq import Connection
+
+from rq import Connection, get_current_job
 from rq.decorators import job
-from rq import get_current_job
 
 
 def say_hello(name=None):
@@ -49,6 +53,10 @@ def access_self():
     return job.id
 
 
+def echo(*args, **kwargs):
+    return (args, kwargs)
+
+
 class Number(object):
     def __init__(self, value):
         self.value = value
@@ -59,6 +67,11 @@ class Number(object):
 
     def div(self, y):
         return self.value / y
+
+
+class CallableObject(object):
+    def __call__(self):
+        return u"I'm callable"
 
 
 with Connection():
